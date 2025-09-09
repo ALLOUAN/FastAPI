@@ -1,0 +1,312 @@
+---
+title: "Analyse du prix par carat des diamants (ggplot2::diamonds)"
+author: "Rapport analytique"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    df_print: tibble
+  pdf_document: default
+fontsize: 11pt
+lang: fr
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 8, fig.height = 5)
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(stringr)
+  library(scales)
+  library(quantreg)
+  library(broom)
+})
+set.seed(123)
+```
+
+## Contexte et objectifs
+
+Ce rapport réalise, sur la base `ggplot2::diamonds`, une série d'analyses: échantillonnage aléatoire simple, bootstrap, échantillonnage stratifié proportionnel par `cut`, estimation des paramètres par strate, comparaison de moyennes globales, bootstrap stratifié des moyennes, ajustement d'un modèle de régression quantile médiane (tau = 0.5), bootstrap des coefficients et visualisations des effets des variables qualitatives. Les résultats sont présentés et interprétés de façon concise.
+
+## 1. Chargement des données et création de `price_per_carat`
+
+```{r}
+data("diamonds", package = "ggplot2")
+# Création de la variable d'intérêt
+Diamonds <- diamonds %>%
+  mutate(price_per_carat = price / carat)
+
+# Aperçu
+Diamonds %>% select(carat, cut, color, clarity, price, price_per_carat) %>% head()
+```
+
+## 2-3. Échantillonnage aléatoire simple (n = 500) et moyenne de `price_per_carat`
+
+```{r}
+# 2) Échantillonnage aléatoire simple sans remise
+n_srs <- 500
+SRS <- Diamonds %>% dplyr::slice_sample(n = n_srs, replace = FALSE)
+
+# 3) Moyenne de price_per_carat sur l'échantillon SRS
+mean_srs_ppc <- mean(SRS$price_per_carat)
+mean_srs_ppc
+```
+
+## 4-5. Bootstrap (B = 500) sur l'échantillon SRS: histogramme et IC à 95%
+
+```{r}
+B <- 500
+boot_means <- replicate(B, {
+  boot_sample <- dplyr::slice_sample(SRS, n = nrow(SRS), replace = TRUE)
+  mean(boot_sample$price_per_carat)
+})
+
+ci_boot <- quantile(boot_means, probs = c(0.025, 0.975))
+ci_boot
+
+# Histogramme des moyennes bootstrap
+as_tibble(boot_means) %>%
+  rename(mean_ppc = value) %>%
+  ggplot(aes(x = mean_ppc)) +
+  geom_histogram(bins = 30, fill = "#2C7FB8", color = "white", alpha = 0.9) +
+  geom_vline(xintercept = mean_srs_ppc, color = "#BD0026", size = 1) +
+  geom_vline(xintercept = ci_boot[1], linetype = "dashed", color = "#253494") +
+  geom_vline(xintercept = ci_boot[2], linetype = "dashed", color = "#253494") +
+  labs(title = "Bootstrap des moyennes de price_per_carat (SRS)",
+       subtitle = "Ligne rouge: moyenne SRS; pointillés: IC 95% bootstrap",
+       x = "Moyenne bootstrap", y = "Fréquence")
+```
+
+### 6. Interprétation succincte
+
+- La distribution bootstrap des moyennes autour de la moyenne SRS donne une idée de l'incertitude d'estimation de la moyenne de `price_per_carat` dans l'échantillon simple.
+- L'intervalle de confiance à 95% (percentiles 2.5% et 97.5%) capture l'ampleur de la variabilité induite par l'échantillonnage.
+
+## 7. Échantillonnage stratifié proportionnel par `cut` (taille totale = 1000)
+
+Nous allouons `n = 1000` observations proportionnellement à la taille des strates, puis nous tirons sans remise au sein de chaque strate.
+
+```{r}
+N_total <- nrow(Diamonds)
+strata_sizes <- Diamonds %>% count(cut, name = "N_h") %>% arrange(cut)
+
+n_total <- 1000
+# Allocation proportionnelle avec correction pour total exact
+alloc <- strata_sizes %>%
+  mutate(raw = n_total * N_h / sum(N_h),
+         n_floor = floor(raw),
+         frac = raw - n_floor) %>%
+  arrange(desc(frac))
+remainder <- n_total - sum(alloc$n_floor)
+alloc <- alloc %>% mutate(add = if_else(row_number() <= remainder, 1L, 0L)) %>%
+  arrange(cut) %>% mutate(n_draw = n_floor + add) %>% select(cut, n_draw)
+alloc
+
+# Tirage stratifié
+Strat <- Diamonds %>%
+  group_by(cut) %>%
+  group_modify(~ dplyr::slice_sample(.x, n = alloc$n_draw[alloc$cut == unique(.x$cut)], replace = FALSE)) %>%
+  ungroup()
+
+nrow(Strat)
+Strat %>% count(cut)
+```
+
+## 8. Moyenne et écart-type de `price_per_carat` par strate (`cut`)
+
+```{r}
+strat_stats <- Strat %>%
+  group_by(cut) %>%
+  summarise(
+    n = n(),
+    mean_ppc = mean(price_per_carat),
+    sd_ppc = sd(price_per_carat)
+  )
+strat_stats
+```
+
+## 9. Comparaison des moyennes globales: SRS vs stratifié
+
+```{r}
+mean_strat_ppc <- mean(Strat$price_per_carat)
+
+tibble(
+  methode = c("SRS (n=500)", "Stratifié proportionnel (n=1000)"),
+  moyenne_price_per_carat = c(mean_srs_ppc, mean_strat_ppc)
+)
+```
+
+Commentaires: la moyenne stratifiée est basée sur un échantillon plus grand et respecte la structure par `cut`. Les deux estimations devraient être proches si l'allocation est proportionnelle et si `price_per_carat` ne varie pas fortement entre strates; sinon, la stratification peut réduire la variance.
+
+## 10-11. Bootstrap stratifié (B = 1000) des moyennes par strate et visualisation
+
+```{r}
+B_strat <- 1000
+strat_boot_tbl <- map_dfr(seq_len(B_strat), function(b) {
+  boot_df <- Strat %>%
+    group_by(cut) %>%
+    group_modify(~ dplyr::slice_sample(.x, n = nrow(.x), replace = TRUE)) %>%
+    ungroup()
+  boot_df %>% group_by(cut) %>% summarise(mean_ppc = mean(price_per_carat), .groups = "drop") %>%
+    mutate(iteration = b)
+})
+
+ci_strat_by_cut <- strat_boot_tbl %>%
+  group_by(cut) %>%
+  summarise(
+    mean_boot = mean(mean_ppc),
+    lower = quantile(mean_ppc, 0.025),
+    upper = quantile(mean_ppc, 0.975),
+    .groups = "drop"
+  )
+ci_strat_by_cut
+
+# Visualisation: histogrammes des moyennes bootstrap par strate
+p_hist_strata <- strat_boot_tbl %>%
+  ggplot(aes(x = mean_ppc)) +
+  geom_histogram(bins = 30, fill = "#74A9CF", color = "white") +
+  facet_wrap(~ cut, scales = "free_x") +
+  labs(title = "Bootstrap stratifié des moyennes par strate (cut)", x = "Moyenne bootstrap par strate", y = "Fréquence")
+
+p_hist_strata
+
+# Visualisation: points et barres d'IC par strate
+ci_strat_by_cut %>%
+  ggplot(aes(x = cut, y = mean_boot)) +
+  geom_point(size = 2, color = "#045A8D") +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.15, color = "#045A8D") +
+  labs(title = "Moyennes bootstrap et IC 95% par strate", x = "Strate (cut)", y = "Moyenne price_per_carat")
+```
+
+Commentaires: les strates présentant une plus grande dispersion de `price_per_carat` montrent des distributions bootstrap plus larges. Les intervalles aident à comparer la position centrale entre strates.
+
+## 12. Régression quantile (tau = 0.5) sur l'échantillon stratifié
+
+Modèle: médiane de `price_per_carat` expliquée par `carat`, `color` et `clarity`.
+
+```{r}
+# S'assurer que color et clarity sont des facteurs (c'est le cas par défaut dans diamonds)
+Strat <- Strat %>% mutate(
+  color = factor(color),
+  clarity = factor(clarity)
+)
+
+fit_rq <- rq(price_per_carat ~ carat + color + clarity, data = Strat, tau = 0.5)
+summary(fit_rq)
+```
+
+## 13-14. Bootstrap des coefficients (B = 1000) et IC à 95%
+
+On réalise un bootstrap stratifié des lignes (tirage avec remise au sein de chaque strate `cut`) afin de respecter le plan d'échantillonnage.
+
+```{r}
+B_coef <- 1000
+coef_names <- names(coef(fit_rq))
+
+boot_coefs <- map_dfr(seq_len(B_coef), function(b) {
+  boot_df <- Strat %>%
+    group_by(cut) %>%
+    group_modify(~ dplyr::slice_sample(.x, n = nrow(.x), replace = TRUE)) %>%
+    ungroup()
+  fit_b <- tryCatch(rq(price_per_carat ~ carat + color + clarity, data = boot_df, tau = 0.5), error = function(e) NULL)
+  if (is.null(fit_b)) {
+    return(tibble(iteration = b, term = coef_names, estimate = NA_real_))
+  }
+  tibble(iteration = b, term = names(coef(fit_b)), estimate = as.numeric(coef(fit_b)))
+})
+
+ci_coefs <- boot_coefs %>%
+  filter(!is.na(estimate)) %>%
+  group_by(term) %>%
+  summarise(
+    median = median(estimate),
+    lower = quantile(estimate, 0.025),
+    upper = quantile(estimate, 0.975),
+    .groups = "drop"
+  ) %>% arrange(term)
+
+ci_coefs
+
+# Visualisation des coefficients avec IC
+ci_coefs %>%
+  ggplot(aes(x = reorder(term, median), y = median)) +
+  geom_point(color = "#238B45") +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2, color = "#238B45") +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey40") +
+  coord_flip() +
+  labs(title = "Coefficients (tau = 0.5) et IC bootstrap 95%",
+       x = "Terme", y = "Effet estimé sur la médiane de price_per_carat")
+```
+
+Analyse de stabilité: les coefficients dont l'IC 95% n'inclut pas 0 sont considérés comme stables et statistiquement significatifs (au sens bootstrap). Les larges intervalles trahissent une incertitude plus forte.
+
+## 15. Analyse critique et implications
+
+- Variabilité: le bootstrap montre une variabilité non négligeable des estimations, sensible aux strates.
+- Stratification: le plan proportionnel par `cut` respecte la structure de la population et tend à améliorer la précision si l'hétérogénéité entre strates est réelle.
+- Régression quantile: `carat` a généralement un effet substantiel sur la médiane du prix par carat; les modalités de `color` et `clarity` modulent significativement la médiane si leurs IC n'incluent pas 0.
+- Prédiction et commercialisation: les variations de qualité (couleur, pureté) influencent la médiane de prix par carat. Pour la tarification, on peut segmenter l'offre selon `cut`, et ajuster les prix médians selon `color` et `clarity`, tout en considérant l'effet de la masse (`carat`).
+
+## 16. Visualisation des effets des variables qualitatives sur la prédiction médiane
+
+On fixe `carat` à sa médiane dans l'échantillon stratifié et on fait varier `color` puis `clarity`.
+
+```{r}
+median_carat <- median(Strat$carat)
+ref_color <- names(sort(table(Strat$color), decreasing = TRUE))[1]
+ref_clarity <- names(sort(table(Strat$clarity), decreasing = TRUE))[1]
+
+# Effet de color (clarity fixée à la modalité la plus fréquente)
+new_color <- tibble(
+  carat = median_carat,
+  color = factor(levels(Strat$color), levels = levels(Strat$color)),
+  clarity = factor(ref_clarity, levels = levels(Strat$clarity))
+)
+new_color <- new_color %>% mutate(pred_median_ppc = as.numeric(predict(fit_rq, newdata = new_color)))
+
+p_color <- new_color %>%
+  ggplot(aes(x = color, y = pred_median_ppc)) +
+  geom_point(size = 2, color = "#1D91C0") +
+  geom_line(aes(group = 1), color = "#1D91C0", alpha = 0.6) +
+  labs(title = paste0("Effet de color sur la médiane prédite (carat=", round(median_carat, 2), ", clarity=", ref_clarity, ")"),
+       x = "Color", y = "Médiane prédite de price_per_carat")
+
+p_color
+
+# Effet de clarity (color fixée à la modalité la plus fréquente)
+new_clarity <- tibble(
+  carat = median_carat,
+  color = factor(ref_color, levels = levels(Strat$color)),
+  clarity = factor(levels(Strat$clarity), levels = levels(Strat$clarity))
+)
+new_clarity <- new_clarity %>% mutate(pred_median_ppc = as.numeric(predict(fit_rq, newdata = new_clarity)))
+
+p_clarity <- new_clarity %>%
+  ggplot(aes(x = clarity, y = pred_median_ppc)) +
+  geom_point(size = 2, color = "#41AB5D") +
+  geom_line(aes(group = 1), color = "#41AB5D", alpha = 0.6) +
+  labs(title = paste0("Effet de clarity sur la médiane prédite (carat=", round(median_carat, 2), ", color=", ref_color, ")"),
+       x = "Clarity", y = "Médiane prédite de price_per_carat")
+
+p_clarity
+```
+
+### Remarques de lecture
+
+- Les graphiques d'effet comparent des niveaux à `carat` fixé. Les écarts verticaux sont directement interprétables en unités de `price_per_carat`.
+- Les résultats se rapportent à la médiane conditionnelle (tau = 0.5), robuste aux valeurs extrêmes par rapport à une régression moyenne.
+
+## Reproductibilité
+
+- Graine pseudo-aléatoire fixée: `set.seed(123)`.
+- Les tailles d'échantillons et le nombre d'itérations bootstrap sont paramétrables via `n_srs`, `B`, `n_total`, `B_strat`, `B_coef`.
+
+```{r session-info, echo=FALSE}
+sessionInfo()
+```
